@@ -9,48 +9,33 @@ export class VCoinsProvider implements SearchProvider {
   readonly source = "vcoins" as const;
 
   async search(params: SearchParams): Promise<CoinListing[]> {
-    const limit = Math.min(params.limit ?? 10, 100);
+    const limit = Math.min(params.limit ?? 10, 25);
     const cacheKey = JSON.stringify({ ...params, limit });
     const cached = cache.get(cacheKey);
-    if (cached) return cached.slice(0, limit);
+    if (cached) return filterByPrice(cached, params.minPrice, params.maxPrice).slice(0, limit);
 
-    const searchUrl = buildVcoinsSearchUrl(params.query, limit, params.minPrice, params.maxPrice);
-    console.log(`[vcoins] generated search URL: ${searchUrl}`);
+    const url = `https://www.vcoins.com/en/Search.aspx?search=true&searchQuery=${encodeURIComponent(params.query)}`;
 
     const parsed = await withRateLimit("vcoins:search", 1500, async () => {
       try {
-        const response = await fetch(searchUrl, {
+        const response = await fetch(url, {
           headers: {
             "User-Agent": "coin-search-api/1.0 (+https://vercel.com)"
           },
           next: { revalidate: 300 }
         });
 
-        console.log(`[vcoins] HTTP status: ${response.status}`);
-
-        if (!response.ok) {
-          console.log(`[vcoins] fallback reason: non-OK HTTP response`);
-          return [];
-        }
-
+        if (!response.ok) return [];
         const html = await response.text();
-        const parsedListings = parseVcoinsSearchHtml(html, limit);
-        console.log(`[vcoins] number of parsed listings: ${parsedListings.length}`);
-
-        if (parsedListings.length === 0) {
-          console.log(`[vcoins] fallback reason: parser returned 0 listings`);
-        }
-
-        return parsedListings;
-      } catch (error) {
-        console.log(`[vcoins] fallback reason: fetch/parse error`, error);
+        return parseVcoinsSearchHtml(html);
+      } catch {
         return [];
       }
     });
 
     const listings = parsed.length > 0 ? parsed : fallbackMockResults(params.query);
     cache.set(cacheKey, listings);
-    return listings.slice(0, limit);
+    return filterByPrice(listings, params.minPrice, params.maxPrice).slice(0, limit);
   }
 
   async extract(url: string): Promise<CoinListing | null> {
@@ -69,117 +54,27 @@ export class VCoinsProvider implements SearchProvider {
   }
 }
 
-function buildVcoinsSearchUrl(query: string, limit: number, minPrice?: number, maxPrice?: number): string {
-  const maxRecords = Math.min(Math.max(limit, 1), 100);
-  const searchBetween = typeof minPrice === "number" ? Math.max(minPrice, 0) : 0;
-  const searchBetweenAnd = typeof maxPrice === "number" ? Math.max(maxPrice, 0) : 0;
-
-  const params = new URLSearchParams({
-    search: "true",
-    searchQuery: query,
-    searchQueryExclude: "",
-    searchCategory: "0",
-    searchCategoryLevel: "2",
-    searchCategoryAncient: "True",
-    searchCategoryUs: "True",
-    searchCategoryWorld: "True",
-    searchCategoryMints: "True",
-    searchBetween: String(searchBetween),
-    searchBetweenAnd: String(searchBetweenAnd),
-    searchDate: "",
-    searchUseThesaurus: "True",
-    searchDisplayCurrency: "",
-    searchDisplay: "1",
-    searchIdStore: "0",
-    searchQueryAnyWords: "",
-    searchExactPhrase: "",
-    searchTitleAndDescription: "True",
-    searchDateType: "0",
-    searchMaxRecords: String(maxRecords),
-    SearchOnSale: "False",
-    Unassigned: "False"
+function filterByPrice(listings: CoinListing[], minPrice?: number, maxPrice?: number): CoinListing[] {
+  return listings.filter((item) => {
+    if (typeof item.price !== "number") return true;
+    if (typeof minPrice === "number" && item.price < minPrice) return false;
+    if (typeof maxPrice === "number" && item.price > maxPrice) return false;
+    return true;
   });
-
-  return `https://www.vcoins.com/en/Search.aspx?${params.toString()}`;
 }
 
-function parseVcoinsSearchHtml(html: string, limit: number): CoinListing[] {
-  const cardChunks = html.split(/<div[^>]+class="[^"]*(?:product|item|searchresult)[^"]*"[^>]*>/i);
-  const items: CoinListing[] = [];
+function parseVcoinsSearchHtml(html: string): CoinListing[] {
+  const matches = [...html.matchAll(/href="(https:\/\/www\.vcoins\.com\/en\/stores\/[^"]+)"/g)].slice(0, 20);
+  const uniqueUrls = Array.from(new Set(matches.map((m) => m[1])));
 
-  for (const chunk of cardChunks) {
-    const listing = parseCardChunk(chunk);
-    if (listing) items.push(listing);
-    if (items.length >= limit) break;
-  }
-
-  if (items.length > 0) return dedupeByUrl(items);
-
-  const fallbackLinks = [...html.matchAll(/href="(https:\/\/www\.vcoins\.com\/en\/stores\/[^"]+)"/gi)].map((m) => m[1]);
-  const uniqueLinks = Array.from(new Set(fallbackLinks)).slice(0, limit);
-  return uniqueLinks.map((url, index) => ({
-    id: `vcoins-${index}-${Buffer.from(url).toString("base64").slice(0, 8)}`,
+  return uniqueUrls.map((url, idx) => ({
+    id: `vcoins-${idx}-${Buffer.from(url).toString("base64").slice(0, 8)}`,
     source: "vcoins",
-    title: `VCoins listing ${index + 1}`,
+    title: `VCoins listing ${idx + 1}`,
     url,
     imageUrls: [],
-    raw: { parsedFrom: "search-link-fallback" }
+    raw: { parsedFrom: "search-html" }
   }));
-}
-
-function parseCardChunk(chunk: string): CoinListing | null {
-  const urlMatch = chunk.match(/href="(https:\/\/www\.vcoins\.com\/en\/stores\/[^"]+)"/i);
-  if (!urlMatch) return null;
-
-  const titleMatch = chunk.match(/title="([^"]+)"/i) ?? chunk.match(/>([^<]{12,220})<\/a>/i);
-  const priceMatch = chunk.match(/(?:US\$|\$|EUR|GBP|CAD|AUD|CHF|JPY)\s*([0-9][0-9,]*(?:\.[0-9]{2})?)/i);
-  const currencyMatch = chunk.match(/(US\$|\$|EUR|GBP|CAD|AUD|CHF|JPY)/i);
-  const dealerMatch = chunk.match(/(?:Dealer|Store|Sold by)[:\s]*<[^>]*>([^<]+)</i) ?? chunk.match(/class="[^"]*dealer[^"]*"[^>]*>([^<]+)</i);
-  const imgMatches = [...chunk.matchAll(/<img[^>]+src="([^"]+)"/gi)].map((m) => absolutizeUrl(m[1]));
-  const descriptionMatch = chunk.match(/<p[^>]*>(.*?)<\/p>/i);
-
-  const cleanTitle = cleanupText(titleMatch?.[1] ?? "");
-  const price = priceMatch ? Number(priceMatch[1].replace(/,/g, "")) : undefined;
-  const currency = normalizeCurrency(currencyMatch?.[1]);
-  const description = cleanupText(descriptionMatch?.[1] ?? "");
-
-  return {
-    id: `vcoins-${Buffer.from(urlMatch[1]).toString("base64").slice(0, 12)}`,
-    source: "vcoins",
-    title: cleanTitle || "VCoins listing",
-    description: description || undefined,
-    price: Number.isFinite(price) ? price : undefined,
-    currency,
-    dealer: cleanupText(dealerMatch?.[1] ?? "") || undefined,
-    url: urlMatch[1],
-    imageUrls: Array.from(new Set(imgMatches)).slice(0, 4),
-    raw: { parsedFrom: "search-card" }
-  };
-}
-
-function normalizeCurrency(symbol?: string): string | undefined {
-  if (!symbol) return undefined;
-  if (symbol === "$" || symbol === "US$") return "USD";
-  return symbol.toUpperCase();
-}
-
-function cleanupText(text: string): string {
-  return text.replace(/<[^>]*>/g, " ").replace(/&nbsp;/g, " ").replace(/\s+/g, " ").trim();
-}
-
-function absolutizeUrl(url: string): string {
-  if (url.startsWith("http")) return url;
-  if (url.startsWith("//")) return `https:${url}`;
-  if (url.startsWith("/")) return `https://www.vcoins.com${url}`;
-  return url;
-}
-
-function dedupeByUrl(listings: CoinListing[]): CoinListing[] {
-  const map = new Map<string, CoinListing>();
-  for (const listing of listings) {
-    if (!map.has(listing.url)) map.set(listing.url, listing);
-  }
-  return Array.from(map.values());
 }
 
 function parseVcoinsListingHtml(html: string, url: string): CoinListing {
